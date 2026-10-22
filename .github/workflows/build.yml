@@ -1,0 +1,25 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build PCLUnlock.exe
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCLUnlock
+          path: PCLUnlock.exe
+          if-no-files-found: error

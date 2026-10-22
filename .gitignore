@@ -1,0 +1,13 @@
+# 编译产物
+PCLUnlock.exe
+*.exe
+
+# 构建缓存
+.cache/
+bin/
+obj/
+
+# IDE
+.vs/
+.idea/
+*.user
