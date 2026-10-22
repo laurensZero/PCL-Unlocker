@@ -24,10 +24,16 @@ if (-not (Test-Path $csc)) {
 $out = Join-Path $root 'PCLUnlock.exe'
 Write-Host '编译 PCLUnlock.exe ...'
 
-& $csc /nologo /target:exe /out:"$out" `
-    /r:"$dnlib" `
-    /resource:"$dnlib",dnlib.dll `
+$cscArgs = @(
+    '/nologo'
+    '/target:exe'
+    "/out:$out"
+    "/r:$dnlib"
+    "/resource:$dnlib,dnlib.dll"
     (Join-Path $root 'src/PCLUnlock.cs')
+)
+
+& $csc @cscArgs
 
 if ($LASTEXITCODE -ne 0) { throw "编译失败，退出码 $LASTEXITCODE" }
 
