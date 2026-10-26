@@ -11,3 +11,14 @@ obj/
 .vs/
 .idea/
 *.user
+
+# 本地私有内容，不上传：
+#   LinkPatches.cs       联机恢复补丁（主程序通过反射扩展点加载）
+#   docs/theme-*         主题破解相关分析
+#   docs/potato-code.md  土豆码（识别码签名）逆向分析
+src/LinkPatches.cs
+docs/theme-engine/
+docs/theme-system.md
+docs/theme-unlock.md
+docs/potato-code.md
+commitmsg.txt

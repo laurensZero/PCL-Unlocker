@@ -234,3 +234,38 @@ Assembly.LoadFrom(patched).GetType("PCL.ModModpack", true)
 每处都带断言，结构不对会明确报错而不是写坏文件；已打过补丁的文件会自动跳过，可以重复运行。
 
 换版本时大概率仍然可用，但**务必重新对照该版本源码**确认分支内容（尤其是 `Case` 的编号和新增的安装器类型）。
+
+## 2.99.0.1（415/416）的适配
+
+官方在 `e3d1cff`（2.99.0.1）里把 `RestrictMcDownload` 的限制铺到了更多 UI 入口，全是同一种模式：原来走运行时判断的三元表达式被常量折叠成 `Visibility.Collapsed(2)`，或者整段代码被 DCE 删掉。对应的补丁大多就是把 `ldc.i4.2` 改回 `ldc.i4.0`，模式与补丁 4 相同。
+
+原有的 5 处下载补丁锚点在这个版本全部保留（两处文案从"暂时不再提供"改成"不再提供"，但锚定的是 `关闭下载` / `为遵守相关法律法规`，不受影响），联机相关的 `PageSetupUI` / `PageLinkMain` 没有改动。
+
+### 版本检测
+
+`ModBase.VersionCode` / `VersionBaseName` 是 VB 的 `Public Const`，编译期内联，但在元数据里仍保留为 literal 字段（和 `RestrictMcDownload` 一样），读 Constant 表即可拿到 413/414/415/416。≥415 才套用新增补丁；识别失败时全部尝试、靠结构匹配自动跳过。
+
+### 新增补丁要点
+
+| 补丁 | 定位 | 动作 |
+|------|------|------|
+| 下载页左侧入口 | `PageDownloadLeft..ctor`：`get/ldfld ItemInstall\|LabResource` + `ldc.i4.2` + `set_Visibility` | `ldc.i4.2 -> 0`；nop 掉最后一个 `stfld PageID`（保留字段初始化的 DownloadInstall）和 `ItemMod.Checked = True` |
+| 安装已有整合包 | `PageResource.set_PageType`：`BtnSearchInstallModPack` 的三元折叠 | `ldc.i4.2 -> 0`（2.99.0.0 是运行时分支，无此形状，自动跳过） |
+| 导入整合包 | `PageSelectLeft.McFolderListUI`：对象初始化器收尾的 `stloc`（把构造完的 ItemInstall 存入局部变量） | 克隆同方法里 ItemAdd 的 `[ldsfld FrmSelectLeft][get_PanList][get_Children][ldloc V][Add][pop]`，插回 `stloc` 之后（2.99.0.0 上 Add 本来就在这个位置） |
+| 启动按钮状态 | `PageLaunchLeft.RefreshButtonsUI`：`ldc.i4.1; stloc V`，窗口内出现 `ldloc V` + `ldfld BtnLaunchState` | `ldc.i4.1 -> ldc.i4.2`（Case 2"下载游戏"分支本来就在 IL 里，只是永远走不到） |
+| Mod 禁用页按钮 | `BtnDownload_Loaded`：`ldc.i4.2; stloc`（NewVisibility 常量折叠），后 6 条内出现 `get_Visibility` | `ldc.i4.2 -> 0` |
+| 空状态按钮 | 含 `无可用版本` 的方法：`BtnEmptyDownload` 的两处 Collapsed 三元组，取第二处（Else 分支里受限的那处，第一处是 ShowHidden 分支、有意保留） | `ldc.i4.2 -> 0` |
+| MC 更新提示 | `McDownloadClientUpdateHint`：`ldstr "确定"` 后紧跟 `ldstr ""` | `"" -> "下载"`（跳转下载页的 `MsgResult = 2` 分支完好） |
+
+几个坑：
+
+- **控件访问形状**：XAML 的 `x:Name` 在 VB 里生成 `WithEvents` 字段 + 包装属性，IL 里可能是 `ldfld` 也可能是 `call get_XXX`，两种都要认（`LoadedControlName`）。414 实测全部走 `get_XXX` 属性（如 `get_BtnEmptyDownload`）。
+- **按字符串找方法必须限定类型**：`"无可用版本"` 在 `PageDownloadModify.ShowComparison` 里也出现过，全局搜索会先命中错误的方法。`"导入整合包"`、`"无可用版本"`、`"Minecraft 更新提示"` 三处都改为 `FindMethodContainingString(类型, 文案)`。
+- **`AddHandler ItemInstall.Click` 走宽松委托闭包**：`AddressOf ModpackInstall` 与 Click 的签名不一致，VB 生成 `_Lambda$__R4-8` 包装方法，IL 里是 `ldftn 闭包方法` 而非 `ldftn ModpackInstall`，不能按后者定位。改为锚定对象初始化器收尾的 `stloc`——2.99.0.0 上 `Children.Add` 本来就紧跟在这条 `stloc` 之后，插入位置与原版逐指令一致（已在 414 上做过"删除-重插"回环验证）。
+- **`CurrentState` 的比较**：`CurrentState = BtnLaunchState` 先 `ldloc` 再 `ldarg.0; ldfld`，且各分支 `stloc` 与合并点之间隔着 `br.s`，定位时要给窗口。
+- **`PageSelectRight` 有两处形状相同的 Collapsed**：`If ShowHidden` 分支里那处是有意保留的，只能改 Else 分支里受限的那处，靠"取第二处"区分，并断言总数恰好为 2。
+- **`PageSelectLeft` 的 Add 回写**：`UIElementCollection.Add` 返回 `int`，VB 以语句调用时会跟一个 `pop`，克隆时按源位置是否有 `pop` 决定。
+- **`PageDownloadLeft..ctor` 的 `stfld PageID` 有两条**：字段初始化器（`DownloadInstall`）在前、限制赋值（`DownloadMod`）在后，只能 nop 最后一条。
+- **`FrmSelectLeft` 声明在 `ModMain` 上**而非 `PageSelectLeft`，克隆时直接复用源位置的真实操作数，不要按声明类型解析。
+
+新增补丁按官方 2.99.0.1 源码逐个核对过编译产物形状，并把真机 414 的 IL 人工改造成 2.99.0.1 形状（模拟 DCE 与常量折叠）做过回环验证：补丁 8 重插的 Add 与原版逐指令一致、补丁 9/11 翻转位置正确；全部带结构断言与自动跳过。尚未在真机 415/416 上完整验证。
