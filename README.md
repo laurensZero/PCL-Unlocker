@@ -137,6 +137,7 @@ Public Const RestrictMcDownload As Boolean = True
 - 2.99.0.1 (416) 真机：修复 `PageDownloadLeft..ctor` 的 `InvalidProgramException`（补丁 6 改为截断到 `InitializeComponent` 后补 `ret`，不再逐条 nop 留下悬空 `ldarg.0`）；下载页可正常打开
 - 2.99.0.1 (416)：补丁 7 按真实的 `ldarg.1; ldc.i4.2; pop; pop; ldc.i4.2` 形状重建为运行时分支，并保留原 `ret` 作为开头 `beq.s` 的目标，避免分支指向已删除指令
 - 补丁 15：解锁版的 `UpdateStart` 入口直接 `ret`，`UpdateCheckByButton` 提示后返回；写盘后的 JIT 校验通过
+- 补丁 6 修复后在 416 原件上重新生成：19 个被修改的方法全部通过 `PrepareMethod` 校验；对已解锁文件重复运行会逐项打印 `[跳过]`，不再改动已恢复的位置
 
 ## 致谢
 
