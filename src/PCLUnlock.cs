@@ -10,6 +10,9 @@
 // 支持版本（运行时自动检测 ModBase.VersionCode，见 DetectVersion）：
 //   2.99.0.0（413 正式版 / 414 快照版）
 //   2.99.0.1（415 正式版 / 416 快照版）
+//   2.99.1 及更高版本：锚点不变则按 2.99.0.1 的形状继续套用，
+//   每个补丁都带结构断言，匹配不到会自动跳过；写盘前还会对所有改动过的
+//   方法做一次 JIT 校验，IL 不合法时直接放弃输出，避免生成会崩溃的 exe。
 //
 // 本仓库只包含下载相关补丁。构建脚本会把 src/ 下所有 .cs 一起编译，
 // 私有补丁（例如联机恢复）放一个 src/LinkPatches.cs 定义
@@ -18,11 +21,14 @@
 // 原文件不会被修改，只输出一个新的 exe。
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Resources;
+using System.Runtime.CompilerServices;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
 
@@ -128,6 +134,15 @@ namespace PclUnlocker
 
         private static int _reportIndex;
 
+        // 记录所有被改动过的方法，写盘后逐个强制 JIT 校验
+        private static readonly List<MethodDef> _patchedMethods = new List<MethodDef>();
+
+        private static void MarkPatched(MethodDef m)
+        {
+            if (m != null && !_patchedMethods.Contains(m))
+                _patchedMethods.Add(m);
+        }
+
         internal static void Report(string msg)
         {
             _reportIndex++;
@@ -176,10 +191,21 @@ namespace PclUnlocker
             // Finished 但 Value 尚未赋值的瞬间。两个版本都有这个竞态。
             PatchLoaderOutputGuards();
 
+            // 启动时预取的版本列表，输入被写成 1，而下载页主加载器用 null。
+            // 两者输入不同会让 LoaderTask 在进入下载页时取消并重发 Mojang 请求，
+            // 表现就是下载页先卡在 0% 几秒。把启动预取的输入也改成 null，
+            // 下载页即可复用同一次请求（仍在加载则直接等待，已完成则立即返回）。
+            PatchStartupVersionPrefetch();
+
             // 私有扩展补丁（如联机恢复），存在 src/LinkPatches.cs 时自动接入
             RunLocalExtensions();
 
             _module.Write(dst);
+
+            // 写盘后用真正的 JIT 编译一遍所有改动过的方法：
+            // 栈不平衡这类错误在新版本上很容易写出来，与其让用户在启动器里
+            // 看到 InvalidProgramException，不如在这里明确失败并删除输出。
+            VerifyPatchedMethods(dst);
         }
 
         // ---------------------------------------------------------------- 版本检测
@@ -208,7 +234,7 @@ namespace PclUnlocker
             {
                 DetectedVersion = Convert.ToInt32(fCode.Constant.Value);
                 string name = fName != null ? fName.Constant.Value as string : null;
-                DetectedName = name ?? (DetectedVersion >= 415 ? "2.99.0.1" : "2.99.0.0");
+                DetectedName = name ?? (DetectedVersion >= 415 ? "2.99.0.1+" : "2.99.0.0");
                 Console.WriteLine("[版本] 检测到 PCL " + DetectedName + " (VersionCode " + DetectedVersion + ")");
             }
             else
@@ -410,6 +436,7 @@ namespace PclUnlocker
                 j++;
             }
 
+            MarkPatched(m);
             Report("下载页 LoaderInit -> DlClientListLoader");
         }
 
@@ -500,6 +527,7 @@ namespace PclUnlocker
             ins.Add(Instruction.Create(OpCodes.Ret));
             body.MaxStack = 8;
 
+            MarkPatched(m);
             Report("整合包安装分派已恢复");
         }
 
@@ -605,6 +633,7 @@ namespace PclUnlocker
             ins.Add(ret);
 
             body.MaxStack = 8;
+            MarkPatched(m);
             Report("整合包文件选择入口已恢复");
         }
 
@@ -624,6 +653,7 @@ namespace PclUnlocker
                     && setter != null && setter.Name == "set_Visibility")
                 {
                     ins[i + 1].OpCode = OpCodes.Ldc_I4_0;
+                    MarkPatched(m);
                     Report("版本修改页 CardMinecraft -> Visible");
                     return;
                 }
@@ -739,6 +769,7 @@ namespace PclUnlocker
                 ins.Insert(start + k, block[k]);
 
             body.MaxStack = 8;
+            MarkPatched(m);
             Report("整合包详情页“点版本行一键安装”已恢复");
         }
 
@@ -751,8 +782,10 @@ namespace PclUnlocker
         //   PageID = FormMain.PageSubType.DownloadMod
         //   ItemMod.Checked = True
         //
-        // 把两处 Visibility 改回 Visible(0)，nop 掉 PageID 赋值（保留字段初始化的
-        // DownloadInstall）与 ItemMod.Checked = True（避免强制切页），行为回到 2.99.0.0。
+        // 构造函数在 InitializeComponent 之后只有这一段。直接截断到
+        // InitializeComponent，再补一条 ret：字段初始化（PageID = DownloadInstall）
+        // 和 XAML 里的 ItemInstall Checked=True 都保留，两处 Visibility 回到默认
+        // 的 Visible。比逐条 nop 安全，不会留下悬空的 ldarg.0 破坏求值栈。
         private static void PatchDownloadLeft()
         {
             TypeDef type = Type("PageDownloadLeft");
@@ -764,65 +797,48 @@ namespace PclUnlocker
             }
 
             IList<Instruction> ins = ctor.Body.Instructions;
-            int patched = 0;
-            for (int i = 1; i + 1 < ins.Count; i++)
+            int init = -1;
+            for (int i = 0; i < ins.Count; i++)
             {
-                if (ins[i].OpCode != OpCodes.Ldc_I4_2 || !IsVisibilitySetter(ins[i + 1])) continue;
-                string ctrl = LoadedControlName(ins, i);
-                if (ctrl == "ItemInstall" || ctrl == "LabResource")
+                IMethod m = ins[i].Operand as IMethod;
+                if (ins[i].OpCode == OpCodes.Call && m != null && m.Name == "InitializeComponent")
                 {
-                    ins[i].OpCode = OpCodes.Ldc_I4_0;
-                    patched++;
+                    init = i;
+                    break;
                 }
             }
 
-            if (patched != 2)
+            if (init < 0)
             {
-                Skip("下载页左侧入口：Visibility 目标不完整（patched=" + patched + "）");
+                Skip("下载页左侧入口：找不到 InitializeComponent");
                 return;
             }
 
-            // PageID = DownloadMod：nop 掉最后一个 stfld PageID 及其常量（前面字段初始化的保留）
-            int last = -1;
-            for (int i = 0; i < ins.Count; i++)
+            if (init + 1 < ins.Count && ins[init + 1].OpCode == OpCodes.Ret)
             {
-                if (ins[i].OpCode == OpCodes.Stfld)
-                {
-                    FieldDef f = ins[i].Operand as FieldDef;
-                    if (f != null && f.Name == "PageID")
-                        last = i;
-                }
-            }
-            if (last > 0 && ins[last - 1].OpCode.Name.StartsWith("ldc.i4"))
-            {
-                ins[last - 1].OpCode = OpCodes.Nop;
-                ins[last - 1].Operand = null;
-                ins[last].OpCode = OpCodes.Nop;
-                ins[last].Operand = null;
+                Skip("下载页左侧入口已恢复（构造函数已截断）");
+                return;
             }
 
-            // ItemMod.Checked = True：nop 掉常量与 setter，避免强制切到 Mod 页
-            for (int i = 1; i + 1 < ins.Count; i++)
-            {
-                if (ins[i].OpCode != OpCodes.Ldc_I4_1) continue;
-                IMethod setter = ins[i + 1].Operand as IMethod;
-                if (setter == null || setter.Name != "set_Checked") continue;
-                if (LoadedControlName(ins, i) != "ItemMod") continue;
-                ins[i].OpCode = OpCodes.Nop;
-                ins[i].Operand = null;
-                ins[i + 1].OpCode = OpCodes.Nop;
-                ins[i + 1].Operand = null;
-                break;
-            }
+            while (ins.Count > init + 1)
+                ins.RemoveAt(init + 1);
+            ins.Add(Instruction.Create(OpCodes.Ret));
 
+            ctor.Body.MaxStack = 8;
+            MarkPatched(ctor);
             Report("下载页左侧“安装/社区资源”入口 -> Visible（默认落回安装页）");
         }
 
         // ---------------------------------------------------------------- 7
         // [2.99.0.1+] 资源页：set_PageType 里“安装已有整合包”按钮的显示条件被改成
         //   If(Value = ModPack AndAlso Not RestrictMcDownload, Visible, Collapsed)
-        // 常量折叠后恒为 Collapsed：[取控件][ldc.i4.2][set_Visibility]。
-        // 2.99.0.0 是运行时分支，不存在该形状，因此匹配不到就跳过。
+        // 常量折叠后条件结果被 pop 掉，最后恒为 Collapsed。416 的真实形状：
+        //
+        //   get_BtnSearchInstallModPack
+        //   ldarg.1; ldc.i4.2; pop; pop; ldc.i4.2; set_Visibility
+        //
+        // 保留前面的 _Type 读写，后半段按源码重建：
+        //   BtnSearchInstallModPack.Visibility = If(Value = ModPack, Visible, Collapsed)
         private static void PatchResourcePackButton()
         {
             TypeDef type = Type("PageResource");
@@ -834,16 +850,86 @@ namespace PclUnlocker
             }
 
             IList<Instruction> ins = setter.Body.Instructions;
-            for (int i = 1; i + 1 < ins.Count; i++)
+
+            if (ins.Any(i => i.OpCode == OpCodes.Bne_Un))
             {
-                if (ins[i].OpCode != OpCodes.Ldc_I4_2 || !IsVisibilitySetter(ins[i + 1])) continue;
-                if (LoadedControlName(ins, i) != "BtnSearchInstallModPack") continue;
-                ins[i].OpCode = OpCodes.Ldc_I4_0;
-                Report("资源页“安装已有整合包”按钮 -> Visible");
+                Skip("资源页“安装已有整合包”按钮已恢复");
                 return;
             }
 
-            Skip("资源页“安装已有整合包”：未找到目标（2.99.0.0 无需此补丁，或已修改过）");
+            int store = -1;
+            for (int i = 0; i < ins.Count; i++)
+            {
+                if (ins[i].OpCode != OpCodes.Stfld) continue;
+                FieldDef f = ins[i].Operand as FieldDef;
+                if (f != null && f.Name == "_Type") { store = i; break; }
+            }
+            if (store < 0)
+            {
+                Skip("资源页“安装已有整合包”：找不到 _Type 赋值");
+                return;
+            }
+
+            Instruction getButton = null;
+            for (int i = store + 1; i < ins.Count; i++)
+            {
+                IMethod m = ins[i].Operand as IMethod;
+                if (ins[i].OpCode == OpCodes.Callvirt && m != null && m.Name == "get_BtnSearchInstallModPack")
+                {
+                    getButton = ins[i];
+                    break;
+                }
+            }
+            IMethod setVisibility = null;
+            for (int i = ins.Count - 1; i > store; i--)
+            {
+                IMethod m = ins[i].Operand as IMethod;
+                if (ins[i].OpCode == OpCodes.Callvirt && m != null && m.Name == "set_Visibility")
+                {
+                    setVisibility = m;
+                    break;
+                }
+            }
+            if (getButton == null || setVisibility == null)
+            {
+                Skip("资源页“安装已有整合包”：找不到按钮或 set_Visibility");
+                return;
+            }
+
+            int retIdx = -1;
+            for (int i = ins.Count - 1; i > store; i--)
+            {
+                if (ins[i].OpCode == OpCodes.Ret) { retIdx = i; break; }
+            }
+            if (retIdx < 0)
+            {
+                Skip("资源页“安装已有整合包”：找不到 ret");
+                return;
+            }
+
+            // 保留原来的 ret 对象：开头的 beq.s 直接以它为分支目标，
+            // 删掉再新建会让旧分支指向已移除的指令。
+            for (int i = retIdx - 1; i > store; i--)
+                ins.RemoveAt(i);
+
+            Instruction collapsed = Nop();
+            Instruction doSet = Nop();
+            int at = store + 1;
+            ins.Insert(at++, Instruction.Create(OpCodes.Ldarg_0));
+            ins.Insert(at++, Instruction.Create(OpCodes.Callvirt, (IMethod)getButton.Operand));
+            ins.Insert(at++, Instruction.Create(OpCodes.Ldarg_1));
+            ins.Insert(at++, Instruction.Create(OpCodes.Ldc_I4_2));       // ResourceTypes.ModPack
+            ins.Insert(at++, Instruction.Create(OpCodes.Bne_Un, collapsed));
+            ins.Insert(at++, Instruction.Create(OpCodes.Ldc_I4_0));       // Visible
+            ins.Insert(at++, Instruction.Create(OpCodes.Br, doSet));
+            ins.Insert(at++, collapsed);
+            ins.Insert(at++, Instruction.Create(OpCodes.Ldc_I4_2));       // Collapsed
+            ins.Insert(at++, doSet);
+            ins.Insert(at++, Instruction.Create(OpCodes.Callvirt, setVisibility));
+
+            setter.Body.MaxStack = 4;
+            MarkPatched(setter);
+            Report("资源页“安装已有整合包”按钮 -> Visible");
         }
 
         // ---------------------------------------------------------------- 8
@@ -968,6 +1054,7 @@ namespace PclUnlocker
             for (int k = 0; k < block.Count; k++)
                 ins.Insert(stlocIdx + 1 + k, block[k]);
 
+            MarkPatched(m);
             Report("版本选择页“导入整合包”入口已恢复");
         }
 
@@ -1035,6 +1122,7 @@ namespace PclUnlocker
                 if (!hit) continue;
 
                 ins[i].OpCode = OpCodes.Ldc_I4_2;
+                MarkPatched(m);
                 Report("启动按钮：无版本时恢复“下载游戏”状态");
                 return;
             }
@@ -1075,6 +1163,7 @@ namespace PclUnlocker
                 if (!sees) continue;
 
                 ins[i].OpCode = OpCodes.Ldc_I4_0;
+                MarkPatched(m);
                 Report("Mod 禁用页“下载 Mod”按钮 -> Visible");
                 return;
             }
@@ -1112,6 +1201,7 @@ namespace PclUnlocker
             }
 
             ins[hits[1]].OpCode = OpCodes.Ldc_I4_0;
+            MarkPatched(m);
             Report("版本列表空状态“下载游戏”按钮 -> Visible");
         }
 
@@ -1138,6 +1228,7 @@ namespace PclUnlocker
                 if (ins[i + 1].OpCode == OpCodes.Ldstr && (string)ins[i + 1].Operand == "")
                 {
                     ins[i + 1].Operand = "下载";
+                    MarkPatched(m);
                     Report("MC 更新提示弹窗恢复“下载”按钮");
                     return;
                 }
@@ -1176,6 +1267,50 @@ namespace PclUnlocker
                 Report("下载页组件加载器空输出保护（" + patched + " 处）");
             else
                 Skip("下载页组件加载器空输出保护已存在");
+        }
+
+        // ---------------------------------------------------------------- 17
+        // 启动预取与下载页共用同一次版本列表请求。
+        //
+        // FormMain 初始化线程里是 DlClientListMojangLoader.Start(1)，
+        // 而下载页的 DlClientListLoader 以 null 输入启动子加载器。
+        // LoaderTask.ShouldStart 发现输入不同，会取消正在进行的启动预取、
+        // 再发一次 Mojang manifest 请求，于是下载页先卡在 0%。
+        // 把启动时的 1 换成 null 后，输入一致：预取还在跑就等它，已跑完直接用。
+        private static void PatchStartupVersionPrefetch()
+        {
+            int patched = 0;
+            foreach (TypeDef type in _module.GetTypes())
+            {
+                foreach (MethodDef method in type.Methods)
+                {
+                    if (!method.HasBody) continue;
+                    IList<Instruction> ins = method.Body.Instructions;
+                    for (int i = 0; i + 3 < ins.Count; i++)
+                    {
+                        if (ins[i].OpCode != OpCodes.Ldsfld) continue;
+                        FieldDef field = ins[i].Operand as FieldDef;
+                        if (field == null || field.Name != "DlClientListMojangLoader") continue;
+                        if (ins[i + 1].OpCode != OpCodes.Ldc_I4_1) continue;
+                        if (ins[i + 2].OpCode != OpCodes.Box) continue;
+                        if (ins[i + 3].OpCode != OpCodes.Ldc_I4_0) continue;
+
+                        // 保留指令数量，避免动到分支目标：1 + box -> null + nop
+                        ins[i + 1].OpCode = OpCodes.Ldnull;
+                        ins[i + 1].Operand = null;
+                        ins[i + 2].OpCode = OpCodes.Nop;
+                        ins[i + 2].Operand = null;
+                        MarkPatched(method);
+                        patched++;
+                        i += 3;
+                    }
+                }
+            }
+
+            if (patched > 0)
+                Report("启动版本列表预取复用（下载页不再重复请求）");
+            else
+                Skip("启动版本列表预取：未找到目标");
         }
 
         private static bool PatchOutputGuard(string methodName, string loaderFieldName)
@@ -1232,7 +1367,125 @@ namespace PclUnlocker
                 ins.Insert(k, guard[k]);
 
             m.Body.MaxStack = 8;
+            MarkPatched(m);
             return true;
+        }
+
+        // ---------------------------------------------------------------- JIT 校验
+
+        // 写出的 exe 里，把所有改动过的方法强制编译一遍。
+        // 新版本上锚点形状稍有变化时，最容易写出“求值栈不平衡”的 IL：
+        // 这种文件能正常写出、能正常启动，直到切到那个页面才抛
+        // InvalidProgramException（2.99.1 的 PageDownloadLeft..ctor 就是这样）。
+        // 这里直接以 JIT 的结果为准，不合法就删掉输出，不让用户拿到坏文件。
+        private static void VerifyPatchedMethods(string path)
+        {
+            if (_patchedMethods.Count == 0)
+                return;
+
+            byte[] image = File.ReadAllBytes(path);
+            string dir = Path.Combine(Path.GetTempPath(),
+                "PCLUnlock_verify_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+
+            ResolveEventHandler resolver = null;
+            try
+            {
+                ExtractEmbeddedAssemblies(dir);
+                resolver = ResolveFrom(dir);
+                AppDomain.CurrentDomain.AssemblyResolve += resolver;
+
+                Assembly asm = Assembly.Load(image);
+                Module manifest = asm.ManifestModule;
+
+                var fatal = new List<string>();
+                var ignored = new List<string>();
+                foreach (MethodDef md in _patchedMethods)
+                {
+                    try
+                    {
+                        MethodBase mb = manifest.ResolveMethod((int)md.MDToken.Raw);
+                        RuntimeHelpers.PrepareMethod(mb.MethodHandle);
+                    }
+                    catch (InvalidProgramException)
+                    {
+                        fatal.Add(Describe(md));
+                    }
+                    catch (Exception ex)
+                    {
+                        // 依赖解析失败之类的环境问题不应阻止输出
+                        ignored.Add(Describe(md) + " (" + ex.GetType().Name + ")");
+                    }
+                }
+
+                if (ignored.Count > 0)
+                {
+                    Console.WriteLine("[校验] 跳过 " + ignored.Count + " 个无法在本进程编译的方法（依赖缺失）:");
+                    foreach (string s in ignored)
+                        Console.WriteLine("       " + s);
+                }
+
+                if (fatal.Count > 0)
+                {
+                    TryDelete(path);
+                    throw new PatchException(
+                        "JIT 校验失败，输出已删除。以下方法被补丁写成了非法 IL（通常是求值栈不平衡）：\n  "
+                        + string.Join("\n  ", fatal.ToArray()));
+                }
+
+                Console.WriteLine("[校验] " + (_patchedMethods.Count - ignored.Count) + " 个被修改的方法通过 JIT 编译");
+            }
+            finally
+            {
+                if (resolver != null)
+                    AppDomain.CurrentDomain.AssemblyResolve -= resolver;
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        private static string Describe(MethodDef m)
+        {
+            return m.DeclaringType.FullName + "." + m.Name + " (token 0x" + m.MDToken.Raw.ToString("X8") + ")";
+        }
+
+        private static ResolveEventHandler ResolveFrom(string dir)
+        {
+            return delegate(object sender, ResolveEventArgs e)
+            {
+                string name = new AssemblyName(e.Name).Name;
+                string file = Path.Combine(dir, name + ".dll");
+                return File.Exists(file) ? Assembly.LoadFrom(file) : null;
+            };
+        }
+
+        // PCL 把 MeloongCore / PCLCS / Newtonsoft.Json 等以 byte[] 存在
+        // PCL.Resources.resources 里，运行时由自己的 AssemblyResolve 加载。
+        // 校验进程里没有那段启动代码，所以先把它们解到临时目录。
+        private static void ExtractEmbeddedAssemblies(string dir)
+        {
+            EmbeddedResource res = _module.Resources.OfType<EmbeddedResource>()
+                .FirstOrDefault(r => r.Name == "PCL.Resources.resources");
+            if (res == null)
+                return;
+
+            using (var reader = new ResourceReader(res.CreateReader().AsStream()))
+            {
+                foreach (DictionaryEntry entry in reader)
+                {
+                    byte[] bytes = entry.Value as byte[];
+                    if (bytes == null) continue;
+
+                    string name = Path.GetFileName((string)entry.Key);
+                    if (!name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                        name += ".dll";
+                    File.WriteAllBytes(Path.Combine(dir, name), bytes);
+                }
+            }
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { File.Delete(path); } catch { }
         }
     }
 }
