@@ -55,6 +55,14 @@
 
 0% 本身仍然是 PCL 在拉 Mojang 的版本清单（网络正常也要 1–4 秒）；补丁 14 只是避免“刚启动就点下载”时把预取取消掉再重发。如果网络到 Mojang 很慢，可以在 PCL 设置里把下载源改成镜像。
 
+### 解锁版的自更新保护（补丁 15）
+
+| # | 位置 | 原状 | 补丁后 |
+|---|------|------|--------|
+| 15 | `ModSecret.UpdateStart` / `ModSecret.UpdateCheckByButton` | 官方更新器拿当前进程路径当目标，会把 `Plain Craft Launcher 2.unlocked.exe` 直接覆盖成官方新版本，补丁全部丢失 | 解锁版跳过自动/静默更新；手动点“检查更新”会提示先更新原版 |
+
+原版 `Plain Craft Launcher 2.exe` 不受影响，仍然可以正常更新。更新完原版后重新运行一次 `PCLUnlock.exe`，就会生成带新版本补丁的解锁版。
+
 恢复后的完整链路：
 
 - 下载页：正式版 / 预览版 / 远古版 / 愚人节版，原版游戏安装，Forge / NeoForge / Fabric / OptiFine / LiteLoader
@@ -64,7 +72,7 @@
 
 补丁前会读取 `ModBase.VersionCode` / `VersionBaseName`（VB 的 `Public Const`，编译期内联，但元数据里仍保留为 literal 字段）判断目标 exe 的版本：
 
-- 413/414 → 按 2.99.0.0 处理，跳过补丁 6–12（补丁 13、14 仍然套用）
+- 413/414 → 按 2.99.0.0 处理，跳过补丁 6–12（补丁 13–15 仍然套用）
 - 415/416 → 按 2.99.0.1 处理，全部套用
 - 识别失败 → 尝试全部补丁，不匹配的位置自动跳过并打印 `[跳过]`
 
@@ -89,7 +97,8 @@ PCLUnlock.exe "Plain Craft Launcher 2.exe" "Plain Craft Launcher 2.unlocked.exe"
 ### 注意
 
 - **原版文件不会被修改**，可以随时对比、回滚。
-- PCL 自动更新会覆盖原版 exe；更新后重新跑一次本工具就行（版本变了也没关系，会自动检测）。
+- 解锁版内置自更新保护：点“检查更新”会提示，不会下载或覆盖 `Plain Craft Launcher 2.unlocked.exe`。
+- 更新 PCL 的方法：退出解锁版 → 运行官方 `Plain Craft Launcher 2.exe` 更新到最新 → 重新运行 `PCLUnlock.exe` 生成新的解锁版。PCL 自动更新不会碰原版以外的文件，版本变了也没关系，工具会自动检测。
 - 需要 .NET Framework 4.x（PCL 本身也依赖它）。
 
 ## 自己编译
@@ -125,6 +134,7 @@ Public Const RestrictMcDownload As Boolean = True
 - 2.99.0.1 (415/416)：补丁 6–12 按官方 commit `e3d1cff` 的源码逐个核对了编译产物形状；并把真机 2.99.0.0 的 IL 人工改造成 2.99.0.1 形状（模拟 DCE 与常量折叠）做了回环验证——“导入整合包”重插的 Add 调用与原版逐指令一致，启动按钮状态、空状态按钮的翻转位置正确。遇到形状不符会打印 `[跳过]` 并保持文件完好，欢迎实测反馈
 - 2.99.0.1 (416) 真机：修复 `PageDownloadLeft..ctor` 的 `InvalidProgramException`（补丁 6 改为截断到 `InitializeComponent` 后补 `ret`，不再逐条 nop 留下悬空 `ldarg.0`）；下载页可正常打开
 - 2.99.0.1 (416)：补丁 7 按真实的 `ldarg.1; ldc.i4.2; pop; pop; ldc.i4.2` 形状重建为运行时分支，并保留原 `ret` 作为开头 `beq.s` 的目标，避免分支指向已删除指令
+- 补丁 15：解锁版的 `UpdateStart` 入口直接 `ret`，`UpdateCheckByButton` 提示后返回；写盘后的 JIT 校验通过
 
 ## 致谢
 

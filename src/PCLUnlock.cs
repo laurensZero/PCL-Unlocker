@@ -197,6 +197,9 @@ namespace PclUnlocker
             // 下载页即可复用同一次请求（仍在加载则直接等待，已完成则立即返回）。
             PatchStartupVersionPrefetch();
 
+            // 解锁版禁用启动器自更新：官方更新器会覆盖当前 exe，把补丁一起冲掉。
+            PatchDisableSelfUpdate();
+
             // 私有扩展补丁（如联机恢复），存在 src/LinkPatches.cs 时自动接入
             RunLocalExtensions();
 
@@ -820,6 +823,33 @@ namespace PclUnlocker
                 return;
             }
 
+            // 截断前先确认尾部只包含“受限赋值”会用到的指令。
+            // 如果新版本在构造函数里加了别的初始化代码，直接截断会把它删掉，
+            // 所以遇到陌生指令就跳过本补丁：入口保持隐藏，但不会崩溃。
+            for (int i = init + 1; i < ins.Count; i++)
+            {
+                Instruction x = ins[i];
+                if (x.OpCode == OpCodes.Ret || x.OpCode == OpCodes.Nop || x.OpCode == OpCodes.Ldarg_0)
+                    continue;
+                if (x.OpCode.Name.StartsWith("ldc.i4"))
+                    continue;
+
+                FieldDef f = x.Operand as FieldDef;
+                if (x.OpCode == OpCodes.Stfld && f != null && f.Name == "PageID")
+                    continue;
+
+                IMethod called = x.Operand as IMethod;
+                if ((x.OpCode == OpCodes.Call || x.OpCode == OpCodes.Callvirt) && called != null)
+                {
+                    string name = called.Name.ToString();
+                    if (name.StartsWith("get_") || name == "set_Visibility" || name == "set_Checked")
+                        continue;
+                }
+
+                Skip("下载页左侧入口：构造函数尾部有未知语句（" + x.OpCode.Name + "），跳过以免误删");
+                return;
+            }
+
             while (ins.Count > init + 1)
                 ins.RemoveAt(init + 1);
             ins.Add(Instruction.Create(OpCodes.Ret));
@@ -1242,6 +1272,57 @@ namespace PclUnlocker
             Skip("MC 更新提示：未找到按钮文本");
         }
 
+        // ---------------------------------------------------------------- 15
+        // 解锁版禁用 PCL 自更新。
+        //
+        // 官方更新器拿到的是当前进程路径（Plain Craft Launcher 2.unlocked.exe），
+        // 更新完成后会直接覆盖它，补丁全部丢失。这里在 UpdateStart 入口直接 ret，
+        // 覆盖“设置页检查更新”和服务器公告的 silentupdate 两条路径；
+        // UpdateCheckByButton 也提前返回并提示，避免用户以为按钮坏了。
+        private static void PatchDisableSelfUpdate()
+        {
+            TypeDef modSecret = Type("ModSecret");
+            TypeDef modMain = _module.GetTypes().FirstOrDefault(t => t.Name == "ModMain");
+            MethodDef hint = modMain == null ? null : modMain.Methods.FirstOrDefault(
+                x => x.Name == "Hint" && x.MethodSig != null && x.MethodSig.Params.Count == 3);
+
+            bool checkPatched = false;
+            MethodDef check = modSecret.Methods.FirstOrDefault(x => x.Name == "UpdateCheckByButton");
+            if (check != null && check.HasBody && hint != null)
+            {
+                IList<Instruction> ins = check.Body.Instructions;
+                bool already = ins.Count > 0 && ins[0].OpCode == OpCodes.Ldstr
+                    && ((string)ins[0].Operand).Contains("解锁版");
+                if (!already)
+                {
+                    ins.Insert(0, Instruction.Create(OpCodes.Ldstr,
+                        "当前是 PCL 解锁版，已禁用启动器自动更新。请先更新原版 Plain Craft Launcher 2.exe，再重新运行 PCLUnlock.exe。"));
+                    ins.Insert(1, Instruction.Create(OpCodes.Ldc_I4_0)); // HintType.Blue
+                    ins.Insert(2, Instruction.Create(OpCodes.Ldc_I4_0)); // Log = False
+                    ins.Insert(3, Instruction.Create(OpCodes.Call, hint));
+                    ins.Insert(4, Instruction.Create(OpCodes.Ret));
+                    check.Body.MaxStack = 8;
+                    MarkPatched(check);
+                    checkPatched = true;
+                }
+            }
+
+            bool startPatched = false;
+            MethodDef start = modSecret.Methods.FirstOrDefault(x => x.Name == "UpdateStart");
+            if (start != null && start.HasBody && start.Body.Instructions.Count > 0
+                && start.Body.Instructions[0].OpCode != OpCodes.Ret)
+            {
+                start.Body.Instructions.Insert(0, Instruction.Create(OpCodes.Ret));
+                MarkPatched(start);
+                startPatched = true;
+            }
+
+            if (startPatched || checkPatched)
+                Report("解锁版禁用启动器自动更新");
+            else
+                Skip("启动器自动更新：已禁用或未找到目标");
+        }
+
         // ---------------------------------------------------------------- 13
         // 下载页组件加载器的 Output.Value 空引用保护。
         //
@@ -1396,15 +1477,22 @@ namespace PclUnlocker
                 AppDomain.CurrentDomain.AssemblyResolve += resolver;
 
                 Assembly asm = Assembly.Load(image);
-                Module manifest = asm.ManifestModule;
 
                 var fatal = new List<string>();
                 var ignored = new List<string>();
                 foreach (MethodDef md in _patchedMethods)
                 {
+                    // 不能按 MetadataToken 反查：dnlib 写盘时会重排方法表，
+                    // 读出来的 token 在写出的文件里可能已经指向别的方法。
+                    MethodBase mb = FindMethod(asm, md);
+                    if (mb == null)
+                    {
+                        ignored.Add(Describe(md) + " (未找到)");
+                        continue;
+                    }
+
                     try
                     {
-                        MethodBase mb = manifest.ResolveMethod((int)md.MDToken.Raw);
                         RuntimeHelpers.PrepareMethod(mb.MethodHandle);
                     }
                     catch (InvalidProgramException)
@@ -1445,7 +1533,40 @@ namespace PclUnlocker
 
         private static string Describe(MethodDef m)
         {
-            return m.DeclaringType.FullName + "." + m.Name + " (token 0x" + m.MDToken.Raw.ToString("X8") + ")";
+            return m.DeclaringType.FullName + "." + m.Name + "(" + m.MethodSig.Params.Count + " 参数)";
+        }
+
+        // 按“类型全名 + 方法名 + 参数个数”在加载后的程序集里找回被修改的方法。
+        // 不走 MetadataToken：dnlib 写盘会重排方法表，token 不保证沿用。
+        private static MethodBase FindMethod(Assembly asm, MethodDef md)
+        {
+            Type type = asm.GetType(md.DeclaringType.ReflectionFullName, false, false);
+            if (type == null)
+                return null;
+
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+                                       | BindingFlags.Static | BindingFlags.Instance
+                                       | BindingFlags.DeclaredOnly;
+            int argc = md.MethodSig != null ? md.MethodSig.Params.Count : 0;
+
+            if (md.IsConstructor)
+            {
+                foreach (ConstructorInfo c in type.GetConstructors(flags))
+                {
+                    if (c.GetParameters().Length == argc)
+                        return c;
+                }
+                return null;
+            }
+
+            foreach (MethodInfo x in type.GetMethods(flags))
+            {
+                if (x.Name != md.Name) continue;
+                if (x.GetParameters().Length != argc) continue;
+                if (x.IsStatic != md.IsStatic) continue;
+                return x;
+            }
+            return null;
         }
 
         private static ResolveEventHandler ResolveFrom(string dir)
