@@ -190,8 +190,9 @@ br <循环尾>
 2. **`HandlerEnd == null` 表示"到方法末尾"。**
    在方法尾部追加 `ret` 时，如果 finally 的 `HandlerEnd` 还是 null，新指令会落进异常处理器范围里。要显式 `eh.HandlerEnd = endLabel`。
 
-3. **栈平衡不会在 JIT 时暴露。**
+3. **栈平衡不会总在 JIT 时暴露。**
    给 `switch` 分支压参数时，必须按目标方法**真实参数个数**压。`InstallPackCompress` 只有 `(File, Archive)` 两个参数，多压一个 `ArchiveBaseFolder` 会让 `leave` 时求值栈非空——`PrepareMethod` 照样通过，运行时才炸。所以参数个数要从 `MethodSig.Params.Count` 推导，别写死。
+   但“方法返回时栈高不为 0”这种错误 JIT 是会拒绝的（见下面的 `PageDownloadLeft..ctor` 案例），所以补丁写完后统一做一次 `PrepareMethod` 仍然很有价值。
 
 4. **`try` 里不能直接 `ret`。**
    要么 `leave` 到 finally 之后再 `ret`，要么把返回值先存局部变量。本补丁统一用前者。
