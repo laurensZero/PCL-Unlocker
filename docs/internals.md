@@ -266,7 +266,43 @@ Assembly.LoadFrom(patched).GetType("PCL.ModModpack", true)
 - **`CurrentState` 的比较**：`CurrentState = BtnLaunchState` 先 `ldloc` 再 `ldarg.0; ldfld`，且各分支 `stloc` 与合并点之间隔着 `br.s`，定位时要给窗口。
 - **`PageSelectRight` 有两处形状相同的 Collapsed**：`If ShowHidden` 分支里那处是有意保留的，只能改 Else 分支里受限的那处，靠"取第二处"区分，并断言总数恰好为 2。
 - **`PageSelectLeft` 的 Add 回写**：`UIElementCollection.Add` 返回 `int`，VB 以语句调用时会跟一个 `pop`，克隆时按源位置是否有 `pop` 决定。
-- **`PageDownloadLeft..ctor` 的 `stfld PageID` 有两条**：字段初始化器（`DownloadInstall`）在前、限制赋值（`DownloadMod`）在后，只能 nop 最后一条。
+- **`PageDownloadLeft..ctor` 的 `stfld PageID` 有两条**：字段初始化器（`DownloadInstall`）在前、限制赋值（`DownloadMod`）在后。删限制赋值时必须连 `ldarg.0` 一起 nop（或直接截断构造函数），只 nop 常量和 `stfld` 会留下悬空接收者，见后文案例。
 - **`FrmSelectLeft` 声明在 `ModMain` 上**而非 `PageSelectLeft`，克隆时直接复用源位置的真实操作数，不要按声明类型解析。
 
-新增补丁按官方 2.99.0.1 源码逐个核对过编译产物形状，并把真机 414 的 IL 人工改造成 2.99.0.1 形状（模拟 DCE 与常量折叠）做过回环验证：补丁 8 重插的 Add 与原版逐指令一致、补丁 9/11 翻转位置正确；全部带结构断言与自动跳过。尚未在真机 415/416 上完整验证。
+新增补丁按官方 2.99.0.1 源码逐个核对过编译产物形状，并把真机 414 的 IL 人工改造成 2.99.0.1 形状（模拟 DCE 与常量折叠）做过回环验证：补丁 8 重插的 Add 与原版逐指令一致、补丁 9/11 翻转位置正确；全部带结构断言与自动跳过。415/416 已在真机 416 上验证下载页可正常打开。
+
+## PageDownloadLeft..ctor：一次真实的 InvalidProgramException
+
+2.99.0.1 上切到下载页会弹：
+
+```
+切换主要页面失败（ID Download）：公共语言运行时检测到无效的程序。
+  在 PCL.PageDownloadLeft..ctor
+错误类型: System.InvalidProgramException
+```
+
+416 的原版构造函数（`InitializeComponent` 之后）：
+
+```il
+ldarg.0 ; callvirt get_ItemInstall  ; ldc.i4.2 ; callvirt set_Visibility
+ldarg.0 ; callvirt get_LabResource  ; ldc.i4.2 ; callvirt set_Visibility
+PageID = DownloadMod                ; ldarg.0 ; ldc.i4.2 ; stfld PageID
+ItemMod.Checked = True              ; ldarg.0 ; callvirt get_ItemMod ; ldc.i4.1 ; callvirt set_Checked
+ret
+```
+
+最初的补丁只把 `ldc.i4.2/1` 和 setter/stfld 换成 `nop`，想“删掉赋值”。但接收者（`ldarg.0` 和 `get_ItemMod`）还留在求值栈上，方法返回时栈高为 2，JIT 直接拒绝编译——而且**编译期、写盘时都不会报错**，只有真的切到那个页面才炸。
+
+正确做法有两种：
+
+1. 整条语句一起 `nop`：接收者、常量、setter/stfld 四个指令全部换成 `nop`；
+2. 更简单：`InitializeComponent` 之后的内容本来就是纯限制代码，直接截断到 `call InitializeComponent` 再补一条 `ret`。字段初始化（`PageID = DownloadInstall`）和 XAML 的默认 `Visibility` 都保留。
+
+现在的实现用第 2 种，并在截断前做尾部指令白名单检查：尾部只允许出现 `ldarg.0` / `ldc.i4.*` / `get_*` / `set_Visibility` / `set_Checked` / `stfld PageID`。新版本如果在这里加了别的初始化语句，会打印 `[跳过]`，不会误删。
+
+### 怎么提前发现这类错误
+
+补丁写盘后，把输出 exe 用 `Assembly.Load(byte[])` 读进来，对每个改动过的方法调用 `RuntimeHelpers.PrepareMethod`：非法 IL 会抛 `InvalidProgramException`，工具随即删除输出。两个细节：
+
+- PCL 的依赖以 `byte[]` 存在 `PCL.Resources.resources` 里（键名没有 `.dll` 后缀），校验前要先解到临时目录并挂 `AssemblyResolve`，否则会得到一堆 `FileNotFoundException`。
+- **不能按 MetadataToken 反查方法**：dnlib 写盘会重排方法表，读到的 token 在写出的文件里可能指向别的方法（实测 `ModpackInstall` 的 token 变成了 `MyPageRight` 的闭包方法）。要按“类型全名 + 方法名 + 参数个数”在反射里找。
