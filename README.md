@@ -39,6 +39,14 @@
 | 11 | `PageSelectRight`（刷新版本列表） | 空状态的“下载游戏”按钮恒为 `Collapsed` | 改回 `Visible`（只改受限的那一处） |
 | 12 | `ModMinecraft.McDownloadClientUpdateHint` | MC 更新提示弹窗的“下载”按钮文本被换成 `""` | 恢复“下载”，跳转下载页的逻辑本来就在 |
 
+### 两个版本共有的稳定性修复（补丁 13）
+
+| # | 位置 | 原状 | 补丁后 |
+|---|------|------|--------|
+| 13 | `PageDownloadInstall.LoadOptiFineGetError` / `LoadFabricGetError` / `LoadNeoForgeGetError` / `LoadLiteLoaderGetError` | 从 MC 更新弹窗直接点“下载”时，主版本列表先完成，`ReloadSelected` 会在组件加载器的 `Output.Value` 还没赋值时读取它，抛 `NullReferenceException`，整个下载页显示红叉 | 入口增加空值保护，数据未就绪时返回“获取中……”，加载器完成后再由 PCL 自己刷新 |
+
+这个空引用只在“更新弹窗 → 下载”的快速路径上稳定复现；手动进入下载页、慢慢选版本时，组件加载器通常已经完成，所以不容易遇到。
+
 恢复后的完整链路：
 
 - 下载页：正式版 / 预览版 / 远古版 / 愚人节版，原版游戏安装，Forge / NeoForge / Fabric / OptiFine / LiteLoader
@@ -48,7 +56,7 @@
 
 补丁前会读取 `ModBase.VersionCode` / `VersionBaseName`（VB 的 `Public Const`，编译期内联，但元数据里仍保留为 literal 字段）判断目标 exe 的版本：
 
-- 413/414 → 按 2.99.0.0 处理，跳过补丁 6–12
+- 413/414 → 按 2.99.0.0 处理，跳过补丁 6–12（补丁 13 仍然套用）
 - 415/416 → 按 2.99.0.1 处理，全部套用
 - 识别失败 → 尝试全部补丁，不匹配的位置自动跳过并打印 `[跳过]`
 
@@ -102,6 +110,7 @@ Public Const RestrictMcDownload As Boolean = True
 
 - 2.99.0.0 (414)：前 5 处下载补丁生成的文件与手工验证过的版本 **逐字节一致**（`sha256 F8AE81A3…`）
 - 补丁 1–5 真机实测：下载页成功拉取版本列表（26.3 正式版 / 26.4-snapshot-5 预览版），Forge / Fabric / NeoForge / OptiFine / LiteLoader 列表全部加载完成；整合包详情页点版本行 → 弹出“输入版本名称”对话框；“安装已有整合包”正常弹出文件选择框
+- 补丁 13 真机实测：从 MC 更新弹窗点“下载”快速进入下载页，不再出现 “未将对象引用设置到对象的实例”，组件列表随后正常填充
 - 相关 4 个类型的 435 个方法全部通过强制 JIT 校验，无 `InvalidProgramException`
 - 2.99.0.1 (415/416)：补丁 6–12 按官方 commit `e3d1cff` 的源码逐个核对了编译产物形状；并把真机 2.99.0.0 的 IL 人工改造成 2.99.0.1 形状（模拟 DCE 与常量折叠）做了回环验证——“导入整合包”重插的 Add 调用与原版逐指令一致，启动按钮状态、空状态按钮的翻转位置正确。遇到形状不符会打印 `[跳过]` 并保持文件完好，欢迎实测反馈
 

@@ -171,6 +171,11 @@ namespace PclUnlocker
             // MC 更新提示的“下载”按钮：2.99.0.1 特有，按模式匹配，任何版本都可安全尝试
             PatchUpdateHintDownload();
 
+            // 组件加载器 Output.Value 空引用保护：从 MC 更新弹窗直接进入下载页时，
+            // 主版本列表刚完成就会进入选择页，而 OptiFine 等加载器可能还处于
+            // Finished 但 Value 尚未赋值的瞬间。两个版本都有这个竞态。
+            PatchLoaderOutputGuards();
+
             // 私有扩展补丁（如联机恢复），存在 src/LinkPatches.cs 时自动接入
             RunLocalExtensions();
 
@@ -1144,6 +1149,90 @@ namespace PclUnlocker
             }
 
             Skip("MC 更新提示：未找到按钮文本");
+        }
+
+        // ---------------------------------------------------------------- 13
+        // 下载页组件加载器的 Output.Value 空引用保护。
+        //
+        // 从 MC 更新弹窗点“下载”时，VersionWaitingSelect 会立刻触发
+        // TrySelectWaitingVersion -> EnterSelectPage -> ReloadSelected。
+        // 此时 DlClientListLoader 已完成，但 OptiFine/Fabric/NeoForge/LiteLoader
+        // 可能正处在“State 已变 Finished、Output.Value 还没赋值”的瞬间。
+        // LoadXGetError 里的 Output.Value 直接解引用就会抛
+        // NullReferenceException，整个 DlClientList Main 被标记为 Failed。
+        //
+        // 在这些方法开头加：
+        //   If Loader.Output.Value Is Nothing Then Return "获取中……"
+        // 加载器完成时 PCL 自己会再次调用 ReloadSelected，届时正常刷新。
+        private static void PatchLoaderOutputGuards()
+        {
+            int patched = 0;
+            patched += PatchOutputGuard("LoadOptiFineGetError", "DlOptiFineListLoader") ? 1 : 0;
+            patched += PatchOutputGuard("LoadFabricGetError", "DlFabricListLoader") ? 1 : 0;
+            patched += PatchOutputGuard("LoadNeoForgeGetError", "DlNeoForgeListLoader") ? 1 : 0;
+            patched += PatchOutputGuard("LoadLiteLoaderGetError", "DlLiteLoaderListLoader") ? 1 : 0;
+
+            if (patched > 0)
+                Report("下载页组件加载器空输出保护（" + patched + " 处）");
+            else
+                Skip("下载页组件加载器空输出保护已存在");
+        }
+
+        private static bool PatchOutputGuard(string methodName, string loaderFieldName)
+        {
+            MethodDef m = Type("PageDownloadInstall").Methods.FirstOrDefault(x => x.Name == methodName);
+            if (m == null || !m.HasBody)
+                return false;
+
+            IList<Instruction> ins = m.Body.Instructions;
+
+            // 已经加过：入口就是 ldsfld loader -> ldflda Output -> ldfld Value -> brtrue
+            IField firstField = ins.Count > 0 ? ins[0].Operand as IField : null;
+            if (ins.Count >= 4
+                && ins[0].OpCode == OpCodes.Ldsfld
+                && firstField != null && firstField.Name == loaderFieldName
+                && ins[1].OpCode == OpCodes.Ldflda
+                && ins[2].OpCode == OpCodes.Ldfld
+                && ins[3].OpCode == OpCodes.Brtrue)
+            {
+                return false;
+            }
+
+            // 找 Loader.Output.Value 的真实 IL 形状，直接复用它的字段引用
+            int pat = -1;
+            for (int i = 0; i + 2 < ins.Count; i++)
+            {
+                if (ins[i].OpCode != OpCodes.Ldsfld) continue;
+                IField lf = ins[i].Operand as IField;
+                if (lf == null || lf.Name != loaderFieldName) continue;
+                if (ins[i + 1].OpCode != OpCodes.Ldflda) continue;
+                IField of = ins[i + 1].Operand as IField;
+                if (of == null || of.Name != "Output") continue;
+                IField vf = ins[i + 2].Operand as IField;
+                if (ins[i + 2].OpCode != OpCodes.Ldfld || vf == null || vf.Name != "Value") continue;
+                pat = i;
+                break;
+            }
+
+            if (pat < 0)
+                return false;
+
+            Instruction originalStart = ins[0];
+            var guard = new List<Instruction>
+            {
+                Instruction.Create(OpCodes.Ldsfld, (IField)ins[pat].Operand),
+                Instruction.Create(OpCodes.Ldflda, (IField)ins[pat + 1].Operand),
+                Instruction.Create(OpCodes.Ldfld, (IField)ins[pat + 2].Operand),
+                Instruction.Create(OpCodes.Brtrue, originalStart),
+                Instruction.Create(OpCodes.Ldstr, "获取中……"),
+                Instruction.Create(OpCodes.Ret)
+            };
+
+            for (int k = 0; k < guard.Count; k++)
+                ins.Insert(k, guard[k]);
+
+            m.Body.MaxStack = 8;
+            return true;
         }
     }
 }
